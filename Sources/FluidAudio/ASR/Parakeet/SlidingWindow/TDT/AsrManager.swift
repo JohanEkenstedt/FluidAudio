@@ -61,6 +61,15 @@ public actor AsrManager {
     internal var vocabulary: [Int: String] = [:]
     /// Sentence-final punctuation ids resolved from `vocabulary` (issue #905).
     internal var punctuationTokenIds: Set<Int> = Set(ASRConstants.punctuationTokens)
+    /// Optional per-step token bias for the v3 decoder; see `TdtTokenBias`.
+    internal var tokenBiasProvider: TdtTokenBiasProvider?
+
+    /// Sets (or clears, with nil) a token bias used by every following
+    /// transcription on v3-family models. Each decode window gets a fresh bias
+    /// from the provider, so parallel windows never share state.
+    public func setTokenBias(_ provider: TdtTokenBiasProvider?) {
+        tokenBiasProvider = provider
+    }
     #if DEBUG
     // Test-only setter
     internal func setVocabularyForTesting(_ vocab: [Int: String]) {
@@ -330,7 +339,8 @@ public actor AsrManager {
                 vocabulary: vocabulary,
                 punctuationTokenIds: punctuationTokenIds,
                 emitTokensAfterGlobalFrame: emitTokensAfterGlobalFrame,
-                initialTimeIndexOverride: initialTimeIndexOverride
+                initialTimeIndexOverride: initialTimeIndexOverride,
+                tokenBias: tokenBiasProvider?.makeBias()
             )
         case .tdtJa:
             // The Japanese model outputs Kanji / Hiragana / Katakana, none of

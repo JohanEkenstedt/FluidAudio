@@ -733,10 +733,13 @@ struct ChunkProcessor {
         if count == 1 {
             return workers
         }
+        // Workers decode windows too, so they carry the same token bias.
+        let tokenBias = await manager.tokenBiasProvider
         for _ in 1..<count {
             guard let clone = await manager.makeWorkerClone() else {
                 return nil
             }
+            await clone.setTokenBias(tokenBias)
             workers.append(clone)
         }
         logger.debug("ChunkProcessor using worker pool of size \(workers.count)")

@@ -114,7 +114,8 @@ internal struct TdtDecoderV3: Sendable {
         vocabulary: [Int: String]? = nil,
         punctuationTokenIds: Set<Int>? = nil,
         emitTokensAfterGlobalFrame: Int? = nil,
-        initialTimeIndexOverride: Int? = nil
+        initialTimeIndexOverride: Int? = nil,
+        tokenBias: TdtTokenBias? = nil
     ) async throws -> TdtHypothesis {
         // Early exit for very short audio (< 160ms)
         guard encoderSequenceLength > 1 else {
@@ -127,7 +128,8 @@ internal struct TdtDecoderV3: Sendable {
         // Script-filtering consumes top-K; skip the extraction when the caller
         // didn't provide a language (default path), so v3 joint runs don't pay
         // for K-length array allocations they'll never use.
-        let needsTopK = language != nil
+        // Token bias also chooses among the top-K candidates.
+        let needsTopK = language != nil || tokenBias != nil
 
         // Build a stride-aware view so we can access encoder frames without extra copies
         let encoderFrames = try EncoderFrameView(
@@ -226,10 +228,106 @@ internal struct TdtDecoderV3: Sendable {
         let maxSymbolsPerStep = config.tdtConfig.maxSymbolsPerStep  // Usually 5-10
         var tokensProcessedThisChunk = 0  // Track tokens per chunk to prevent runaway decoding
 
+        // ===== TOKEN BIAS: CHECKPOINT AND ROLLBACK =====
+        // See `TdtTokenBias`. A checkpoint holds everything the loop needs to
+        // resume at the step where the bias first overrode the model.
+        tokenBias?.reset()
+        var checkpoint: BiasCheckpoint? = nil
+        var deficit: Float = 0
+        // After a rollback the model's own choice stands at that position.
+        var vetoTime = -1
+        var vetoCount = -1
+        var rollbacks = 0
+        // Set when this step opened the checkpoint; the bias starts tracking
+        // once the overriding token is emitted.
+        var openedThisStep = false
+
+        func makeCheckpoint() throws -> BiasCheckpoint {
+            var saved = hypothesis
+            if let state = hypothesis.decState {
+                // runDecoder writes h/c in place, so the state must be copied.
+                saved.decState = try TdtDecoderState(from: state)
+            }
+            return BiasCheckpoint(
+                timeIndices: timeIndices,
+                safeTimeIndices: safeTimeIndices,
+                activeMask: activeMask,
+                timeIndicesCurrentLabels: timeIndicesCurrentLabels,
+                lastEmissionTimestamp: lastEmissionTimestamp,
+                emissionsAtThisTimestamp: emissionsAtThisTimestamp,
+                tokensProcessedThisChunk: tokensProcessedThisChunk,
+                hypothesis: saved,
+                predictorOutput: try decoderState.predictorOutput.map(Self.copyArray),
+                bias: tokenBias?.snapshot()
+            )
+        }
+
+        func rollback() {
+            guard let saved = checkpoint else { return }
+            timeIndices = saved.timeIndices
+            safeTimeIndices = saved.safeTimeIndices
+            activeMask = saved.activeMask
+            timeIndicesCurrentLabels = saved.timeIndicesCurrentLabels
+            lastEmissionTimestamp = saved.lastEmissionTimestamp
+            emissionsAtThisTimestamp = saved.emissionsAtThisTimestamp
+            tokensProcessedThisChunk = saved.tokensProcessedThisChunk
+            hypothesis = saved.hypothesis
+            decoderState.predictorOutput = saved.predictorOutput
+            tokenBias?.restore(saved.bias)
+            vetoTime = saved.timeIndices
+            vetoCount = saved.hypothesis.ySequence.count
+            checkpoint = nil
+            deficit = 0
+            rollbacks += 1
+        }
+
+        /// Lets the bias re-rank this step. Returns false when the step must
+        /// restart from a rollback.
+        func applyBias(label: inout Int, score: inout Float, topKIds: [Int]?, topKLogits: [Float]?) throws -> Bool {
+            guard let bias = tokenBias, let ids = topKIds, let logits = topKLogits,
+                rollbacks < Self.maxBiasRollbacks,
+                !(timeIndices == vetoTime && hypothesis.ySequence.count == vetoCount)
+            else { return true }
+
+            let best = label
+            let chosen = bias.choose(
+                best: best, blank: config.tdtConfig.blankId, candidateIds: ids, candidateLogits: logits)
+            guard chosen != best,
+                let bestIndex = ids.firstIndex(of: best),
+                let chosenIndex = ids.firstIndex(of: chosen)
+            else { return true }
+
+            let cost = max(0, logits[bestIndex] - logits[chosenIndex])
+            if checkpoint == nil {
+                // A single override that already costs too much is not worth trying.
+                if cost > bias.maxDeficit { return true }
+                checkpoint = try makeCheckpoint()
+                deficit = 0
+                openedThisStep = true
+            }
+            deficit += cost
+            if deficit > bias.maxDeficit {
+                rollback()
+                return false
+            }
+            label = chosen
+            score = Self.softmaxProbability(of: chosenIndex, in: logits)
+            return true
+        }
+
         // ===== MAIN DECODING LOOP =====
         // Process each encoder frame until we've consumed all audio
-        while activeMask {
+        mainLoop: while true {
+            if !activeMask {
+                // The audio ran out inside a biased path that never completed.
+                if checkpoint != nil {
+                    rollback()
+                    continue mainLoop
+                }
+                break mainLoop
+            }
             try Task.checkCancellation()
+            openedThisStep = false
             // Use last emitted token for decoder context, or blank if starting
             var label = hypothesis.lastToken ?? config.tdtConfig.blankId
             let stateToUse = hypothesis.decState ?? decoderState
@@ -297,6 +395,11 @@ internal struct TdtDecoderV3: Sendable {
                 Self.applyEnglishBlocklist(
                     label: &label, score: &score,
                     topKIds: ids, topKLogits: logits, vocabulary: vocab, blankId: blankId)
+            }
+            if try !applyBias(
+                label: &label, score: &score, topKIds: decision.topKIds, topKLogits: decision.topKLogits)
+            {
+                continue mainLoop
             }
 
             // Map duration bin to actual frame count
@@ -386,6 +489,12 @@ internal struct TdtDecoderV3: Sendable {
                         label: &label, score: &score,
                         topKIds: ids, topKLogits: logits, vocabulary: vocab, blankId: blankId)
                 }
+                if try !applyBias(
+                    label: &label, score: &score,
+                    topKIds: innerDecision.topKIds, topKLogits: innerDecision.topKLogits)
+                {
+                    continue mainLoop
+                }
 
                 duration = try TdtDurationMapping.mapDurationBin(
                     innerDecision.durationBin, durationBins: config.tdtConfig.durationBins)
@@ -411,7 +520,7 @@ internal struct TdtDecoderV3: Sendable {
                 // Check per-chunk token limit to prevent runaway decoding
                 tokensProcessedThisChunk += 1
                 if tokensProcessedThisChunk > config.tdtConfig.maxTokensPerChunk {
-                    break
+                    break mainLoop
                 }
 
                 let emissionTimestamp = timeIndicesCurrentLabels + globalFrameOffset
@@ -463,6 +572,20 @@ internal struct TdtDecoderV3: Sendable {
                     safeTimeIndices = min(timeIndices, lastTimestep)
                     emissionsAtThisTimestamp = 0
                     lastEmissionTimestamp = -1
+                }
+
+                if let bias = tokenBias {
+                    bias.emitted(token: label)
+                    if openedThisStep { bias.track() }
+                    if checkpoint != nil {
+                        if bias.completed {
+                            checkpoint = nil
+                            deficit = 0
+                        } else if !bias.matching {
+                            rollback()
+                            continue mainLoop
+                        }
+                    }
                 }
             }
 
@@ -612,6 +735,38 @@ internal struct TdtDecoderV3: Sendable {
         // the issue #512 Polish samples (0 filter swaps across 7 clips), so no
         // filter call is needed here; post-processing handles deduplication.
         return hypothesis
+    }
+
+    /// Guard against a bias that keeps rolling back.
+    static let maxBiasRollbacks = 200
+
+    /// Everything the main loop needs to resume at a biased step.
+    private struct BiasCheckpoint {
+        let timeIndices: Int
+        let safeTimeIndices: Int
+        let activeMask: Bool
+        let timeIndicesCurrentLabels: Int
+        let lastEmissionTimestamp: Int
+        let emissionsAtThisTimestamp: Int
+        let tokensProcessedThisChunk: Int
+        let hypothesis: TdtHypothesis
+        let predictorOutput: MLMultiArray?
+        let bias: Any?
+    }
+
+    private static func copyArray(_ array: MLMultiArray) throws -> MLMultiArray {
+        let copy = try MLMultiArray(shape: array.shape, dataType: array.dataType)
+        copy.copyData(from: array)
+        return copy
+    }
+
+    /// Softmax probability of one top-K candidate, normalised over the top-K.
+    private static func softmaxProbability(of index: Int, in logits: [Float]) -> Float {
+        var maxLogit: Float = -.infinity
+        for l in logits where l > maxLogit { maxLogit = l }
+        var sumExp: Float = 0
+        for l in logits { sumExp += expf(l - maxLogit) }
+        return sumExp > 0 ? expf(logits[index] - maxLogit) / sumExp : 0
     }
 
     internal static func shouldEmitToken(
